@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+.pi-loop.json.lock
+# секреты / токены «Среды»
+skills/sreda_send/config.json
+state.json
