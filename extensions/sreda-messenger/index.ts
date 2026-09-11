@@ -27,11 +27,20 @@
  *
  * Имя сессии: ctx.sessionManager.getSessionName(); если не задано — «(без названия)».
  *
+ * Защита от ложных срабатываний:
+ *   — если последнее сообщение сессии — assistant-вызов субагента
+ *     (subagent / subagent_resume, после него нет tool_result), агент ждёт результат субагента —
+ *     это НЕ окончание работы: «Работа завершена» не отправляется;
+ *   — MUTE: если в .sreda-notify.json записан "enabled" false (или LLM вызвал
+ *     tool sreda_notify enabled=false, когда пользователь попросил не присылать сообщений) —
+ *     ни одно автоматическое сообщение не отправляется, в TUI показывается «MUTE»;
+ *
  * Настройки:
  *   config.json рядом с index.ts:      { "recipient": "32.klorshteinve@rosstat.gov.ru" }
  *   логин/пароль/токены — skills/sreda_send/config.json (state в .sreda/).
  */
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { Type } from "typebox";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import * as os from "node:os";
@@ -182,6 +191,49 @@ function notify(pi: ExtensionAPI, text: string, kind: "info" | "error"): void {
   try { (pi as any).ui?.notify?.(text, kind); } catch { /* ignore */ }
 }
 
+// ─────────────────────────────────────────────── MUTE-состояние
+
+const STATE_PATH = path.join(__dirname, ".sreda-notify.json");
+
+function stateEnabled(): boolean {
+  try {
+    const s = JSON.parse(fs.readFileSync(STATE_PATH, "utf8"));
+    return s.enabled !== false;
+  } catch { /* нет файла — уведомления включены */ return true; }
+}
+
+function setStateEnabled(v: boolean): void {
+  try { fs.writeFileSync(STATE_PATH, JSON.stringify({ enabled: v, ts: Date.now() }, null, 2) + "\n", "utf8"); } catch { /* ignore */ }
+}
+
+/** Последняя (хвостовая) запись ветки — assistant-вызов субагента, после которого
+ *  ещё не было tool_result → агент ждёт результат субагента (fire-and-forget). */
+function hasPendingSubagent(ctx: any): boolean {
+  try {
+    const sm = ctx?.sessionManager;
+    const entries: any[] =
+      (typeof sm?.buildContextEntries === "function" ? sm.buildContextEntries() : null) ??
+      (typeof sm?.getBranch === "function" ? sm.getBranch() : null) ??
+      [];
+    for (let i = entries.length - 1; i >= 0; i--) {
+      const e = entries[i];
+      if (!e) continue;
+      if (e.type !== "message") continue; // custom entries между — не мешают
+      if (e.message?.role === "user") return false; // после вызова вернулся result/новое сообщение — уже не ожидание
+      if (e.message?.role !== "assistant") continue;
+      const c = e.message.content;
+      const arr = Array.isArray(c) ? c : [c];
+      const names = arr
+        .filter((b: any) => b && typeof b === "object" && (b.type === "toolCall" || b.type === "tool_use" || typeof b.name === "string"))
+        .map((b: any) => String(b.name ?? ""));
+      const hit = names.some((n: string) => /subagent/i.test(n)) || /\bsubagent(_resume)?\b/.test(JSON.stringify(e.message));
+      if (hit) return true;
+      return false; // ассистент-сообщение без вызова субагента — ожидание отсутствует
+    }
+  } catch { /* по умолчанию: без ожидания */ }
+  return false;
+}
+
 // ─────────────────────────────────────────────── действия
 
 const EXT_DIR = __dirname;
@@ -248,6 +300,11 @@ async function sendOtvotPdf(replyText: string): Promise<boolean> {
 
 /** Завершение работы: текст, затем otvet.pdf. */
 async function notifyDone(pi: ExtensionAPI, replyText: string, name: string): Promise<void> {
+  if (!stateEnabled()) {
+    notify(pi, "Sreda: MUTE - «Работа завершена» не отправлена", "info");
+    console.error("[Sreda-Ext] MUTE - завершение не отправлено");
+    return;
+  }
   const text = `Pi-агент. Сессия:\n${name}\nРабота завершена\n${fmtTs()}`;
   const okText = await sendText(text);
   let pdf: string = "";
@@ -265,6 +322,11 @@ async function notifyDone(pi: ExtensionAPI, replyText: string, name: string): Pr
 
 /** Возобновление работы: только текст. */
 async function notifyResumed(pi: ExtensionAPI, name: string): Promise<void> {
+  if (!stateEnabled()) {
+    notify(pi, "Sreda: MUTE - «возобновлена» не отправлена", "info");
+    console.error("[Sreda-Ext] MUTE - возобновление не отправлено");
+    return;
+  }
   const text = `Pi-агент. Сессия:\n${name}\nвозобновлена\n${fmtTs()}`;
   const ok = await sendText(text);
   notify(pi, "Среда: " + text.replace(/\n/g, " "), ok ? "info" : "error");
@@ -272,7 +334,39 @@ async function notifyResumed(pi: ExtensionAPI, name: string): Promise<void> {
 
 // ─────────────────────────────────────────────── события
 
+/** Забегалка: pi-процесс запущен как субагент (PI_SUBAGENT_* заданы) —
+ *  у субагента уведомления «Среды» отключены полностью: только основной агент уведомляет. */
+const IN_SUBAGENT = Boolean(
+  process.env.PI_SUBAGENT_ID ?? process.env.PI_SUBAGENT_NAME ?? process.env.PI_SUBAGENT_SESSION,
+);
+if (IN_SUBAGENT) {
+  console.error("[Sreda-Ext] работает как субагент (PI_SUBAGENT_*) - уведомления в «Среду» отключены");
+}
+
 export default function (pi: ExtensionAPI): void {
+  // ── tool переключения уведомлений (вызывает LLM, когда пользователь просит не слать / слать) ──
+  try {
+    pi.registerTool({
+      name: "sreda_notify",
+      label: "Sreda Notify",
+      description:
+        "Включить/выключить автоуведомления в мессенджер «Среда» от расширения sreda-messenger. " +
+        "Use when the user asks the agent NOT to send messenger messages/notifications (enabled=false) " +
+        "or to resume them (enabled=true).",
+      promptSnippet: "Turn Sreda messenger auto-notifications on or off",
+      parameters: Type.Object({ enabled: Type.Boolean() }),
+      async execute(_toolCallId: string, params: { enabled: boolean }) {
+        const v = params.enabled === true;
+        setStateEnabled(v);
+        const msg = v ? "Sreda: автоматические уведомления ВКЛЮЧЕНЫ" : "Sreda: автоматические уведомления ВЫКЛЮЧЕНЫ";
+        console.error("[Sreda-Ext] " + msg);
+        return { content: [{ type: "text", text: msg }] };
+      },
+    });
+  } catch (e) {
+    console.error("[Sreda-Ext] registerTool(sreda_notify): " + (e as Error).message);
+  }
+
   if (!info) {
     pi.on("agent_settled", () => {
       console.error("[Sreda-Ext] нет скрила/конфига — уведомление о завершении не отправлено");
@@ -284,6 +378,7 @@ export default function (pi: ExtensionAPI): void {
   // isIdle() = false, пока pi обработывает ран, авто-ретрай, auto-compact или очередь;
   // hasPendingMessages() — есть queued продолжения. В этих случаях «Завершена» не шлём.
   pi.on("agent_settled", async (_event: any, ctx: any) => {
+    if (IN_SUBAGENT) return;
     let idle = true;
     let pending = false;
     try {
@@ -294,6 +389,10 @@ export default function (pi: ExtensionAPI): void {
     if (_pendingDone) clearTimeout(_pendingDone);
     _pendingDone = setTimeout(() => {
       _pendingDone = null;
+      if (hasPendingSubagent(ctx)) {
+        console.error("[Sreda-Ext] агент ждёт результат субагента - «Работа завершена» не отправлена");
+        return;
+      }
       void enqueueWork(async () => {
         await notifyDone(pi, lastAssistantText(ctx), sessionName(ctx));
       });
@@ -310,10 +409,12 @@ export default function (pi: ExtensionAPI): void {
   // сообщения «сразу после хода» (внутри тихого окна) — это продолжение той же работы:
   // ни «Завершена», ни «Возобновлена» не шлём.
   pi.on("input", async (event: any, ctx: any) => {
+    if (IN_SUBAGENT) return;
     const text = String(event?.text ?? "").trim();
     if (!text) return;
     if (event?.source === "extension") return; // не уведомлять на инъекциянные сообщения
     if (text.startsWith("/")) return;          // TUI-команда, не работа
+    if (hasPendingSubagent(ctx)) return;      // результат субагента/продолжение — не возобновление
     if (!lastAssistantText(ctx)) return;       // первое сообщение сессии — это старт, не возобновление
     if (typeof ctx?.isIdle === "function" && ctx.isIdle() === false) return; // агент уже работает — это не возобновление
     if (_pendingDone) {                        // continuation сразу после хода — промолчать

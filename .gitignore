@@ -4,3 +4,5 @@ __pycache__/
 # секреты / токены «Среды»
 skills/sreda_send/config.json
 state.json
+# MUTE-состояние расширения sreda-messenger
+extensions/sreda-messenger/.sreda-notify.json
