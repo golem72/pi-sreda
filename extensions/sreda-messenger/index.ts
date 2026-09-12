@@ -223,10 +223,15 @@ function hasPendingSubagent(ctx: any): boolean {
       if (e.message?.role !== "assistant") continue;
       const c = e.message.content;
       const arr = Array.isArray(c) ? c : [c];
-      const names = arr
-        .filter((b: any) => b && typeof b === "object" && (b.type === "toolCall" || b.type === "tool_use" || typeof b.name === "string"))
-        .map((b: any) => String(b.name ?? ""));
-      const hit = names.some((n: string) => /subagent/i.test(n)) || /\bsubagent(_resume)?\b/.test(JSON.stringify(e.message));
+      // Считаем ТОЛЬКО реальный незавершённый вызов инструмента subagent/subagent_resume.
+      // Упоминание слова «subagent» в ТЕКСТЕ сообщения — НЕ ожидание (ложное срабатывание).
+      const toolCalls = arr.filter(
+        (b: any) =>
+          b && typeof b === "object" &&
+          (b.type === "toolCall" || b.type === "tool_use" || b.type === "toolUse") &&
+          typeof b.name === "string",
+      );
+      const hit = toolCalls.some((b: any) => /subagent(_resume)?$/i.test(b.name));
       if (hit) return true;
       return false; // ассистент-сообщение без вызова субагента — ожидание отсутствует
     }
