@@ -26,6 +26,11 @@
  *        дд.мм.гггг чч:мм:сс
  *      (+ message.pdf, если есть текст последнего ответа)
  *
+ *      Ожидающий субагент (запущен fire-and-forget, subagent_result ещё не прилетел —
+ *      нетто-счёт в hasPendingSubagent): «Работа завершена» ПОДАВЛЯЕТся, но текущий
+ *      ответ агента уходит отдельным message.pdf (его могут ещё дополнить). Финальное
+ *      «Работа завершена» придёт, когда субагент завершит работу и агент доработает.
+ *
  *      Субагент (pi-процесс с PI_SUBAGENT_*): молчит при нормальном завершении;
  *      при остановке из-за ошибки шлёт своё короткое сообщение без PDF:
  *        Pi-субагент:
@@ -251,35 +256,51 @@ function setStateEnabled(v: boolean): void {
   try { fs.writeFileSync(STATE_PATH, JSON.stringify({ enabled: v, ts: Date.now() }, null, 2) + "\n", "utf8"); } catch { /* ignore */ }
 }
 
-/** Последняя (хвостовая) запись ветки — assistant-вызов субагента, после которого
- *  ещё не было tool_result → агент ждёт результат субагента (fire-and-forget). */
+/**
+ * «У агента есть хотя бы один незавершённый субагент» (fire-and-forget запущен,
+ * subagent_result ещё не прилетел).
+ *
+ * Считается НЕТТО по всей истории сессии (в хронологическом порядке записей):
+ *   +1 — assistant-вызов инструмента `subagent` / `subagent_resume` (запуск/возобновление);
+ *   −1 — запись `custom_message` с customType `subagent_result` (результат доставлен — субагент отработал);
+ *   −1 — assistant-вызов `subagent_interrupt` (субагент прерван — ждать его результат нечего).
+ * Fire-and-forget ack (toolResult) НЕ считается завершением: он приходит сразу после запуска,
+ * тогда как настоящим завершением является именно стир subagent_result.
+ * Нетто-счёт сам компенсирует «запущен→завершён» в прошлом, в остатке — те, что ещё работают.
+ * (Ниже нуля не уходим.)
+ */
 function hasPendingSubagent(ctx: any): boolean {
   try {
     const sm = ctx?.sessionManager;
     const entries: any[] =
+      (typeof sm?.getEntries === "function" ? sm.getEntries() : null) ??
       (typeof sm?.buildContextEntries === "function" ? sm.buildContextEntries() : null) ??
       (typeof sm?.getBranch === "function" ? sm.getBranch() : null) ??
       [];
-    for (let i = entries.length - 1; i >= 0; i--) {
-      const e = entries[i];
+    let pending = 0;
+    for (const e of entries) {
       if (!e) continue;
-      if (e.type !== "message") continue; // custom entries между — не мешают
-      if (e.message?.role === "user") return false; // после вызова вернулся result/новое сообщение — уже не ожидание
-      if (e.message?.role !== "assistant") continue;
+      // завершение: доставка результата субагента (steer)
+      if (e.type === "custom_message" && /subagent_result/i.test(String(e.customType ?? ""))) {
+        if (pending > 0) pending -= 1;
+        continue;
+      }
+      // запуск / прерывание — внутри assistant-сообщения
+      if (e.type !== "message" || e.message?.role !== "assistant") continue;
       const c = e.message.content;
-      const arr = Array.isArray(c) ? c : [c];
-      // Считаем ТОЛЬКО реальный незавершённый вызов инструмента subagent/subagent_resume.
-      // Упоминание слова «subagent» в ТЕКСТЕ сообщения — НЕ ожидание (ложное срабатывание).
-      const toolCalls = arr.filter(
-        (b: any) =>
-          b && typeof b === "object" &&
-          (b.type === "toolCall" || b.type === "tool_use" || b.type === "toolUse") &&
-          typeof b.name === "string",
-      );
-      const hit = toolCalls.some((b: any) => /subagent(_resume)?$/i.test(b.name));
-      if (hit) return true;
-      return false; // ассистент-сообщение без вызова субагента — ожидание отсутствует
+      if (!Array.isArray(c)) continue;
+      for (const b of c) {
+        if (!b || typeof b !== "object") continue;
+        if (b.type !== "toolCall" && b.type !== "tool_use" && b.type !== "toolUse") continue;
+        const name = typeof b.name === "string" ? b.name : "";
+        if (/^subagent(_resume)?$/i.test(name)) {
+          pending += 1;
+        } else if (/^subagent_interrupt$/i.test(name)) {
+          if (pending > 0) pending -= 1;
+        }
+      }
     }
+    return pending > 0;
   } catch { /* по умолчанию: без ожидания */ }
   return false;
 }
@@ -462,7 +483,25 @@ export default function (pi: ExtensionAPI): void {
         return;
       }
       if (hasPendingSubagent(ctx)) {
-        console.error("[Sreda-Ext] агент ждёт результат субагента — уведомление о завершении не отправлено");
+        // Субагент ещё работает: «Работа завершена» подавляем, но текущий ответ
+        // агента передаём в message.pdf (его к моменту финала могут ещё дополнить).
+        const reply = lastAssistantText(ctx);
+        console.error(
+          "[Sreda-Ext] агент ждёт результат субагента — «Работа завершена» задерживаю" +
+            (reply.trim() ? ", отправляю message.pdf" : " (текст пуст, ничего не отправляю)"),
+        );
+        if (stateEnabled() && reply.trim()) {
+          void enqueueWork(async () => {
+            const ok = await sendMessagePdf(reply);
+            notify(
+              pi,
+              ok
+                ? "Среда: message.pdf отправлено (субагент в работе, «Работа завершена» будет позже)"
+                : "Среда: «Работа завершена» задержана (субагент в работе), message.pdf не отправлено",
+              ok ? "info" : "error",
+            );
+          });
+        }
         return;
       }
       void enqueueWork(async () => {
