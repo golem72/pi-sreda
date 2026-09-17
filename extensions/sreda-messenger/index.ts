@@ -7,16 +7,35 @@
  *   1. при ОКОНЧАТЕЛЬНОМ завершении работы агента: агент_settled + «тихое окно»
  *      (ctx.isIdle() — true, нет очереди сообщений, и в течение QUIET_MS не стартовало
  *      новое выполнение — queued continuation / steering / авто-ретрай).
- *      В этом случае:
+ *
+ *      Нормальное завершение (последнее assistant-сообщение со stopReason "stop"):
  *        сообщение 1 (текст, переносы как задано):
  *          Pi-агент. Сессия:
  *          <имя сессии>
  *          Работа завершена
  *          дд.мм.гггг чч:мм:сс
- *        сообщение 2: вложение «otvet.pdf» — финальный ответ агента,
+ *        сообщение 2: вложение «message.pdf» — финальный ответ агента,
  *                     отрендеренный в PDF через `node <skill>/md2pdf.cjs`;
  *                     если node/chromium недоступны — только текст, ошибка в TUI.
- *      Если в течение тихого окна агент продолжил работать — «Завершена» НЕ шлётся.
+ *
+ *      Остановка из-за ошибки (поседнее assistant-сообщение со stopReason "error",
+ *      напр. «Request timed out»): вместо «Работа завершена» —
+ *        Pi-агент. Сессия:
+ *        <имя сессии>
+ *        Остановлен из-за ошибки
+ *        дд.мм.гггг чч:мм:сс
+ *      (+ message.pdf, если есть текст последнего ответа)
+ *
+ *      Субагент (pi-процесс с PI_SUBAGENT_*): молчит при нормальном завершении;
+ *      при остановке из-за ошибки шлёт своё короткое сообщение без PDF:
+ *        Pi-субагент:
+ *        <имя субагента, PI_SUBAGENT_NAME>
+ *        Сессия:
+ *        <имя сессии>
+ *        Остановлен из-за ошибки
+ *        дд.мм.гггг чч:мм:сс
+ *
+ *      Если в течение тихого окна агент продолжил работать — ничего не шлётся (см. ниже).
  *
  *   2. при возобновлении работы агента (новое сообщение пользователя в сессии, где уже
  *      есть ответ ассистента, и не сразу после «тихого окна» незавершённого хода):
@@ -187,6 +206,32 @@ function lastAssistantText(ctx: any): string {
   return "";
 }
 
+/** stopReason последнего assistant-сообщения (независимо от наличия текста). *
+ *  "error" = остановка из-за ошибки (напр. «Request timed out»);
+ *  "stop"  = нормальное завершение; могут быть и "length", "aborted". */
+function lastStopReason(ctx: any): string | null {
+  try {
+    const sm = ctx?.sessionManager;
+    const entries: any[] =
+      (typeof sm?.buildContextEntries === "function" ? sm.buildContextEntries() : null) ??
+      (typeof sm?.getBranch === "function" ? sm.getBranch() : null) ??
+      [];
+    for (let i = entries.length - 1; i >= 0; i--) {
+      const e = entries[i];
+      if (!e || e.type !== "message" || e.message?.role !== "assistant") continue;
+      const sr = e.message.stopReason;
+      if (typeof sr === "string") return sr;
+    }
+  } catch { /* ignore */ }
+  return null;
+}
+
+/** Имя субагента из env (задаётся @maplezzk/pi-interactive-subagents), если есть. */
+function subagentName(): string | null {
+  const n = (process.env.PI_SUBAGENT_NAME ?? "").trim();
+  return n ? n : null;
+}
+
 function notify(pi: ExtensionAPI, text: string, kind: "info" | "error"): void {
   try { (pi as any).ui?.notify?.(text, kind); } catch { /* ignore */ }
 }
@@ -271,16 +316,16 @@ async function sendText(text: string): Promise<boolean> {
   return r.code === 0;
 }
 
-/** Сообщение 2: вложение otvet.pdf (финальный ответ агента), без отдельного текста. */
-async function sendOtvotPdf(replyText: string): Promise<boolean> {
+/** Сообщение 2: вложение message.pdf (финальный ответ агента), без отдельного текста. */
+async function sendMessagePdf(replyText: string): Promise<boolean> {
   if (!info || !cfg) return false;
   if (!info.node || !info.md2pdf) {
-    console.error("[Sreda-Ext] node/md2pdf.cjs недоступны — otvet.pdf не сформирован");
+    console.error("[Sreda-Ext] node/md2pdf.cjs недоступны — message.pdf не сформирован");
     return false;
   }
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "sreda-otvet-"));
-  const src = path.join(dir, "otvet.src.md");
-  const pdf = path.join(dir, "otvet.pdf"); // базовое имя — otvet.pdf (именно так придёт в чате)
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "sreda-msg-"));
+  const src = path.join(dir, "message.src.md");
+  const pdf = path.join(dir, "message.pdf"); // базовое имя — message.pdf (именно так придёт в чате)
   let okConv = false;
   try {
     fs.writeFileSync(src, replyText, "utf8");
@@ -299,29 +344,29 @@ async function sendOtvotPdf(replyText: string): Promise<boolean> {
   }
   const r = await runScript(info, ["send", "--to", cfg.recipient, "--attach", pdf]);
   try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* ignore */ }
-  if (r.code !== 0) console.error("[Sreda-Ext] send otvet.pdf: code=" + r.code + " err=" + r.err.trim().slice(-800));
+  if (r.code !== 0) console.error("[Sreda-Ext] send message.pdf: code=" + r.code + " err=" + r.err.trim().slice(-800));
   return r.code === 0;
 }
 
-/** Завершение работы: текст, затем otvet.pdf. */
-async function notifyDone(pi: ExtensionAPI, replyText: string, name: string): Promise<void> {
+/** Завершение работы: текст (заголовок: «Работа завершена» или «Остановлен из-за ошибки»), затем message.pdf. */
+async function notifyDone(pi: ExtensionAPI, replyText: string, name: string, headline = "Работа завершена"): Promise<void> {
   if (!stateEnabled()) {
-    notify(pi, "Sreda: MUTE - «Работа завершена» не отправлена", "info");
-    console.error("[Sreda-Ext] MUTE - завершение не отправлено");
+    notify(pi, `Sreda: MUTE - «${headline}» не отправлена`, "info");
+    console.error(`[Sreda-Ext] MUTE - «${headline}» не отправлено`);
     return;
   }
-  const text = `Pi-агент. Сессия:\n${name}\nРабота завершена\n${fmtTs()}`;
+  const text = `Pi-агент. Сессия:\n${name}\n${headline}\n${fmtTs()}`;
   const okText = await sendText(text);
   let pdf: string = "";
   if (replyText.trim()) {
-    if (await sendOtvotPdf(replyText)) pdf = " + otvet.pdf";
+    if (await sendMessagePdf(replyText)) pdf = " + message.pdf";
     else pidErr();
   } else {
-    console.error("[Sreda-Ext] рабочий ответ агента пуст — otvet.pdf не отправлен");
+    console.error("[Sreda-Ext] рабочий ответ агента пуст — message.pdf не отправлен");
   }
   notify(pi, "Среда: " + text.replace(/\n/g, " ") + pdf, "info");
   function pidErr(): void {
-    console.error("[Sreda-Ext] otvet.pdf не отправлен (node/Chromium недоступны?)");
+    console.error("[Sreda-Ext] message.pdf не отправлен (node/Chromium недоступны?)");
   }
 }
 
@@ -337,15 +382,29 @@ async function notifyResumed(pi: ExtensionAPI, name: string): Promise<void> {
   notify(pi, "Среда: " + text.replace(/\n/g, " "), ok ? "info" : "error");
 }
 
+/** Остановка субагента из-за ошибки: короткое текстовое сообщение (без PDF). */
+async function notifySubagentStopped(pi: ExtensionAPI, ctx: any): Promise<void> {
+  if (!stateEnabled()) {
+    notify(pi, "Sreda: MUTE - «Остановлен из-за ошибки» (субагент) не отправлено", "info");
+    console.error("[Sreda-Ext] MUTE - остановка субагента не отправлена");
+    return;
+  }
+  const subName = subagentName() ?? "(без названия)";
+  const text = `Pi - субагент:\n${subName}\nСессия:\n${sessionName(ctx)}\nОстановлен из-за ошибки\n${fmtTs()}`;
+  const ok = await sendText(text);
+  notify(pi, "Среда: " + text.replace(/\n/g, " "), ok ? "info" : "error");
+}
+
 // ─────────────────────────────────────────────── события
 
-/** Забегалка: pi-процесс запущен как субагент (PI_SUBAGENT_* заданы) —
- *  у субагента уведомления «Среды» отключены полностью: только основной агент уведомляет. */
+/** Забегалка: pi-процесс запущен как субагент (PI_SUBAGENT_* заданы).
+ *  Субагент молчит при нормальном завершении (antispam);
+ *  при остановке из-за ошибки шлёт своё короткое сообщение — см. notifySubagentStopped. */
 const IN_SUBAGENT = Boolean(
   process.env.PI_SUBAGENT_ID ?? process.env.PI_SUBAGENT_NAME ?? process.env.PI_SUBAGENT_SESSION,
 );
 if (IN_SUBAGENT) {
-  console.error("[Sreda-Ext] работает как субагент (PI_SUBAGENT_*) - уведомления в «Среду» отключены");
+  console.error("[Sreda-Ext] работает как субагент (PI_SUBAGENT_*) — уведомления в «Среду» только при остановке из-за ошибки");
 }
 
 export default function (pi: ExtensionAPI): void {
@@ -381,9 +440,8 @@ export default function (pi: ExtensionAPI): void {
 
   // ── ОКОНЧАТЕЛЬНОЕ завершение: агент_settled + тихое окно ──
   // isIdle() = false, пока pi обработывает ран, авто-ретрай, auto-compact или очередь;
-  // hasPendingMessages() — есть queued продолжения. В этих случаях «Завершена» не шлём.
+  // hasPendingMessages() — есть queued продолжения. В этих случаях завершение не шлём.
   pi.on("agent_settled", async (_event: any, ctx: any) => {
-    if (IN_SUBAGENT) return;
     let idle = true;
     let pending = false;
     try {
@@ -394,12 +452,21 @@ export default function (pi: ExtensionAPI): void {
     if (_pendingDone) clearTimeout(_pendingDone);
     _pendingDone = setTimeout(() => {
       _pendingDone = null;
+      // нормальное завершение vs остановка из-за ошибки (stopReason последнего assistant- хода)
+      const isError = lastStopReason(ctx) === "error";
+      if (IN_SUBAGENT) {
+        // Субагент: при нормальном завершении молчит (антиспам);
+        // при остановке из-за ошибки — шлёт своё короткое сообщение.
+        if (!isError) return;
+        void enqueueWork(() => notifySubagentStopped(pi, ctx));
+        return;
+      }
       if (hasPendingSubagent(ctx)) {
-        console.error("[Sreda-Ext] агент ждёт результат субагента - «Работа завершена» не отправлена");
+        console.error("[Sreda-Ext] агент ждёт результат субагента — уведомление о завершении не отправлено");
         return;
       }
       void enqueueWork(async () => {
-        await notifyDone(pi, lastAssistantText(ctx), sessionName(ctx));
+        await notifyDone(pi, lastAssistantText(ctx), sessionName(ctx), isError ? "Остановлен из-за ошибки" : "Работа завершена");
       });
     }, QUIET_MS);
   });
