@@ -70,6 +70,27 @@ import * as path from "node:path";
 import * as os from "node:os";
 import { execFile, spawnSync } from "node:child_process";
 
+// ─────────────────────────────────────────────── логирование (без TUI)
+// Диагностические сообщения пишутся в локальный лог-файл, а НЕ в консоль/TUI —
+// чтобы в интерфейсе не было мусорных строк «[Sreda-Ext] …». Размер файла ограничен.
+const LOG_PATH = path.join(__dirname, ".sreda-ext.log");
+const LOG_MAX_BYTES = 256 * 1024; // ~256 КБ
+const LOG_KEEP = Math.floor(LOG_MAX_BYTES / 2); // при переполнении оставляем хвост
+function dbg(msg: string): void {
+  try {
+    const line = `[${new Date().toISOString()}] ${String(msg).replace(/\s+/g, " ")}\n`;
+    let size = -1;
+    try { size = fs.statSync(LOG_PATH).size; } catch { /* файла ещё нет */ }
+    if (size >= 0 && size + line.length > LOG_MAX_BYTES) {
+      let tail = "";
+      try { tail = fs.readFileSync(LOG_PATH, "utf8").slice(-LOG_KEEP); } catch { /* ignore */ }
+      fs.writeFileSync(LOG_PATH, tail + line, "utf8");
+      return;
+    }
+    fs.appendFileSync(LOG_PATH, line, "utf8");
+  } catch { /* ошибка логирования не критична */ }
+}
+
 // ─────────────────────────────────────────────── конфиг и поиск интерпретаторов
 
 interface SredaConfig { recipient: string }
@@ -90,7 +111,7 @@ function loadConfig(ext_dir: string): SredaConfig | null {
     if (!cfg.recipient.includes("@")) cfg.recipient += "@rosstat.gov.ru";
     return cfg;
   } catch {
-    console.error(`[Sreda-Ext] нет config.json с 'recipient' в ${cfgPath}`);
+    dbg(`[Sreda-Ext] нет config.json с 'recipient' в ${cfgPath}`);
     return null;
   }
 }
@@ -129,7 +150,7 @@ function findScript(ext_dir: string): string | null {
     path.join(ext_dir, "..", "..", "skills", "sreda_send", "sreda_send.py"),
   ];
   for (const p of cands) if (fs.existsSync(p)) return path.resolve(p);
-  console.error("[Sreda-Ext] skills/sreda_send/sreda_send.py не найден:\n  " + cands.join("\n  "));
+  dbg("[Sreda-Ext] skills/sreda_send/sreda_send.py не найден:\n  " + cands.join("\n  "));
   return null;
 }
 
@@ -310,7 +331,7 @@ function hasPendingSubagent(ctx: any): boolean {
 const EXT_DIR = __dirname;
 const info = resolveScript(EXT_DIR);
 if (!info) {
-  console.error("[Sreda-Ext] инициализация не удалась — уведомления выключены");
+  dbg("[Sreda-Ext] инициализация не удалась — уведомления выключены");
 }
 
 const cfg = info ? info.cfg : null;
@@ -323,7 +344,7 @@ let _chain: Promise<void> = Promise.resolve();
 /** Очередь отправок: без параллельных дублей, без взаимных блокировок. */
 function enqueueWork(fn: () => Promise<void>): Promise<void> {
   const p = _chain.then(fn).catch((e: unknown) => {
-    console.error("[Sreda-Ext] " + (e as Error).message);
+    dbg("[Sreda-Ext] " + (e as Error).message);
   });
   _chain = p;
   return p;
@@ -333,7 +354,7 @@ function enqueueWork(fn: () => Promise<void>): Promise<void> {
 async function sendText(text: string): Promise<boolean> {
   if (!info || !cfg) return false;
   const r = await runScript(info, ["send", "--to", cfg.recipient, "--text", text]);
-  if (r.code !== 0) console.error("[Sreda-Ext] send text: code=" + r.code + " err=" + r.err.trim().slice(-800));
+  if (r.code !== 0) dbg("[Sreda-Ext] send text: code=" + r.code + " err=" + r.err.trim().slice(-800));
   return r.code === 0;
 }
 
@@ -341,7 +362,7 @@ async function sendText(text: string): Promise<boolean> {
 async function sendMessagePdf(replyText: string): Promise<boolean> {
   if (!info || !cfg) return false;
   if (!info.node || !info.md2pdf) {
-    console.error("[Sreda-Ext] node/md2pdf.cjs недоступны — message.pdf не сформирован");
+    dbg("[Sreda-Ext] node/md2pdf.cjs недоступны — message.pdf не сформирован");
     return false;
   }
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "sreda-msg-"));
@@ -355,9 +376,9 @@ async function sendMessagePdf(replyText: string): Promise<boolean> {
       maxBuffer: 8 * 1024 * 1024,
     });
     okConv = r.status === 0 && fs.existsSync(pdf) && fs.statSync(pdf).size > 0;
-    if (!okConv) console.error("[Sreda-Ext] md2pdf: exit=" + r.status + " err=" + String(r.stderr ?? "").trim().slice(-800));
+    if (!okConv) dbg("[Sreda-Ext] md2pdf: exit=" + r.status + " err=" + String(r.stderr ?? "").trim().slice(-800));
   } catch (e) {
-    console.error("[Sreda-Ext] md2pdf: " + (e as Error).message);
+    dbg("[Sreda-Ext] md2pdf: " + (e as Error).message);
   }
   if (!okConv) {
     try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* ignore */ }
@@ -365,7 +386,7 @@ async function sendMessagePdf(replyText: string): Promise<boolean> {
   }
   const r = await runScript(info, ["send", "--to", cfg.recipient, "--attach", pdf]);
   try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* ignore */ }
-  if (r.code !== 0) console.error("[Sreda-Ext] send message.pdf: code=" + r.code + " err=" + r.err.trim().slice(-800));
+  if (r.code !== 0) dbg("[Sreda-Ext] send message.pdf: code=" + r.code + " err=" + r.err.trim().slice(-800));
   return r.code === 0;
 }
 
@@ -373,7 +394,7 @@ async function sendMessagePdf(replyText: string): Promise<boolean> {
 async function notifyDone(pi: ExtensionAPI, replyText: string, name: string, headline = "Работа завершена"): Promise<void> {
   if (!stateEnabled()) {
     notify(pi, `Sreda: MUTE - «${headline}» не отправлена`, "info");
-    console.error(`[Sreda-Ext] MUTE - «${headline}» не отправлено`);
+    dbg(`[Sreda-Ext] MUTE - «${headline}» не отправлено`);
     return;
   }
   const text = `Pi-агент. Сессия:\n${name}\n${headline}\n${fmtTs()}`;
@@ -383,11 +404,11 @@ async function notifyDone(pi: ExtensionAPI, replyText: string, name: string, hea
     if (await sendMessagePdf(replyText)) pdf = " + message.pdf";
     else pidErr();
   } else {
-    console.error("[Sreda-Ext] рабочий ответ агента пуст — message.pdf не отправлен");
+    dbg("[Sreda-Ext] рабочий ответ агента пуст — message.pdf не отправлен");
   }
   notify(pi, "Среда: " + text.replace(/\n/g, " ") + pdf, "info");
   function pidErr(): void {
-    console.error("[Sreda-Ext] message.pdf не отправлен (node/Chromium недоступны?)");
+    dbg("[Sreda-Ext] message.pdf не отправлен (node/Chromium недоступны?)");
   }
 }
 
@@ -395,7 +416,7 @@ async function notifyDone(pi: ExtensionAPI, replyText: string, name: string, hea
 async function notifyResumed(pi: ExtensionAPI, name: string): Promise<void> {
   if (!stateEnabled()) {
     notify(pi, "Sreda: MUTE - «возобновлена» не отправлена", "info");
-    console.error("[Sreda-Ext] MUTE - возобновление не отправлено");
+    dbg("[Sreda-Ext] MUTE - возобновление не отправлено");
     return;
   }
   const text = `Pi-агент. Сессия:\n${name}\nвозобновлена\n${fmtTs()}`;
@@ -407,7 +428,7 @@ async function notifyResumed(pi: ExtensionAPI, name: string): Promise<void> {
 async function notifySubagentStopped(pi: ExtensionAPI, ctx: any): Promise<void> {
   if (!stateEnabled()) {
     notify(pi, "Sreda: MUTE - «Остановлен из-за ошибки» (субагент) не отправлено", "info");
-    console.error("[Sreda-Ext] MUTE - остановка субагента не отправлена");
+    dbg("[Sreda-Ext] MUTE - остановка субагента не отправлена");
     return;
   }
   const subName = subagentName() ?? "(без названия)";
@@ -425,7 +446,7 @@ const IN_SUBAGENT = Boolean(
   process.env.PI_SUBAGENT_ID ?? process.env.PI_SUBAGENT_NAME ?? process.env.PI_SUBAGENT_SESSION,
 );
 if (IN_SUBAGENT) {
-  console.error("[Sreda-Ext] работает как субагент (PI_SUBAGENT_*) — уведомления в «Среду» только при остановке из-за ошибки");
+  dbg("[Sreda-Ext] работает как субагент (PI_SUBAGENT_*) — уведомления в «Среду» только при остановке из-за ошибки");
 }
 
 export default function (pi: ExtensionAPI): void {
@@ -444,17 +465,18 @@ export default function (pi: ExtensionAPI): void {
         const v = params.enabled === true;
         setStateEnabled(v);
         const msg = v ? "Sreda: автоматические уведомления ВКЛЮЧЕНЫ" : "Sreda: автоматические уведомления ВЫКЛЮЧЕНЫ";
-        console.error("[Sreda-Ext] " + msg);
+        dbg("[Sreda-Ext] " + msg);
+        notify(pi, msg, "info");
         return { content: [{ type: "text", text: msg }] };
       },
     });
   } catch (e) {
-    console.error("[Sreda-Ext] registerTool(sreda_notify): " + (e as Error).message);
+    dbg("[Sreda-Ext] registerTool(sreda_notify): " + (e as Error).message);
   }
 
   if (!info) {
     pi.on("agent_settled", () => {
-      console.error("[Sreda-Ext] нет скрила/конфига — уведомление о завершении не отправлено");
+      dbg("[Sreda-Ext] нет скрила/конфига — уведомление о завершении не отправлено");
     });
     return;
   }
@@ -486,7 +508,7 @@ export default function (pi: ExtensionAPI): void {
         // Субагент ещё работает: «Работа завершена» подавляем, но текущий ответ
         // агента передаём в message.pdf (его к моменту финала могут ещё дополнить).
         const reply = lastAssistantText(ctx);
-        console.error(
+        dbg(
           "[Sreda-Ext] агент ждёт результат субагента — «Работа завершена» задерживаю" +
             (reply.trim() ? ", отправляю message.pdf" : " (текст пуст, ничего не отправляю)"),
         );

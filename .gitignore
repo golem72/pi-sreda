@@ -6,3 +6,5 @@ skills/sreda_send/config.json
 state.json
 # MUTE-состояние расширения sreda-messenger
 extensions/sreda-messenger/.sreda-notify.json
+# лог диагностики расширения sreda-messenger (не в TUI, в файле)
+extensions/sreda-messenger/.sreda-ext.log
