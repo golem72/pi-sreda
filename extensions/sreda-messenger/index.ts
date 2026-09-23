@@ -326,6 +326,63 @@ function hasPendingSubagent(ctx: any): boolean {
   return false;
 }
 
+// ── Гейтинг MUTE: enabled=false разрешается только при прямом запросе пользователя ──
+// (защита от «агент сам решит выключить уведомления» — см. инцидент 23.09: сессия LLM
+//  включила MUTE по своей инициативе, в сессии не было актуального запроса «не слать».)
+const MUTE_INTENT_PATTERNS: RegExp[] = [
+  /уведомлени[яи]?\w*[\s\S]{0,30}(?:выключ|отключ|приостанов|замол)/i,
+  /(?:выключи|выключить|отключи|отключить|приостановь|замолчи|мьют|mute)[\s\S]{0,60}(?:уведомлени|sreda|среду|«середу|notifications?)/i,
+  /(?:выключи|выключить|отключи|отключить)[\s\S]{0,60}(?:среду|«середу|sreda)/i,
+  /не\s+(?:слать|шлать|присылай|присылать|отправляй|отправлять)/i,
+  /\bdon'?t\s+send/i,
+  /\bstop\s+sending/i,
+  /\bno\s+more\s+(?:messages?|notifications?|notifs?)/i,
+  /\bturn\s+off\s+(?:the\s+)?(?:notifications?|messages?)/i,
+];
+
+/**
+ * Есть ли в транскрипте сессии (последние до 10 реплик пользователя, не старше 24 ч)
+ * прямой запрос пользователя не слать / отключить уведомления?
+ */
+function userMuteRequest(ctx: any): boolean {
+  let entries: any[] = [];
+  try {
+    const sm = ctx?.sessionManager;
+    entries =
+      (typeof sm?.getEntries === "function" ? sm.getEntries() : null) ??
+      (typeof sm?.buildContextEntries === "function" ? sm.buildContextEntries() : null) ??
+      [];
+  } catch { return false; }
+  if (!Array.isArray(entries) || entries.length === 0) return false;
+  const now = Date.now();
+  const MAX_AGE_MS = 24 * 3600 * 1000;
+  let seen = 0;
+  for (let i = entries.length - 1; i >= 0 && seen <= 10; i--) {
+    const e = entries[i];
+    if (!e || e.type !== "message") continue;
+    const m = e.message;
+    if (!m || m.role !== "user") continue;
+    let text = "";
+    const c = m.content;
+    if (typeof c === "string") text = c;
+    else if (Array.isArray(c)) {
+      for (const b of c) if (b && b.type === "text" && typeof b.text === "string") text += b.text + "\n";
+    }
+    if (!text.trim()) continue;
+    seen++;
+    // Возраст реплики: если явно задан и слишком старый — запрос не даёт права.
+    const ts: unknown = m.timestamp ?? e.timestamp;
+    let ageMs = NaN;
+    if (typeof ts === "number" && ts > 0) ageMs = now - ts;
+    else if (typeof ts === "string") { const p = Date.parse(ts); if (!isNaN(p)) ageMs = now - p; }
+    if (!isNaN(ageMs) && ageMs > MAX_AGE_MS) continue;
+    for (const re of MUTE_INTENT_PATTERNS) {
+      if (re.test(text)) return true;
+    }
+  }
+  return false;
+}
+
 // ─────────────────────────────────────────────── действия
 
 const EXT_DIR = __dirname;
@@ -457,14 +514,30 @@ export default function (pi: ExtensionAPI): void {
       label: "Sreda Notify",
       description:
         "Включить/выключить автоуведомления в мессенджер «Среда» от расширения sreda-messenger. " +
-        "Use when the user asks the agent NOT to send messenger messages/notifications (enabled=false) " +
+        "enabled=true (включить) — разрешено всегда. " +
+        "enabled=false (MUTE) — принимаем ТОЛЬКО при явном запросе пользователя в этом разговоре " +
+        "(«не слать», «выключи уведомления» и т.п.): расширение проверяет запрос и может отказать. " +
+        "Use when the user asks the agent NOT to send messenger messages (enabled=false) " +
         "or to resume them (enabled=true).",
       promptSnippet: "Turn Sreda messenger auto-notifications on or off",
+      promptGuidelines: [
+        "sreda_notify(enabled=false) — только если пользователь сам просит не слать (прямая фраза в разговоре); расширение проверит и может отказать. enabled=true — можно в любой момент.",
+      ],
       parameters: Type.Object({ enabled: Type.Boolean() }),
-      async execute(_toolCallId: string, params: { enabled: boolean }) {
+      async execute(_toolCallId: string, params: { enabled: boolean }, _signal: unknown, _onUpdate: unknown, ctx: any) {
         const v = params.enabled === true;
+        if (!v && !userMuteRequest(ctx)) {
+          const msg =
+            "Sreda: MUTE отклонён — в этой сессии не найден прямой запрос пользователя «не слать». " +
+            "Выключать уведомления можно только по явной просьбе пользователя; enabled=true разрешён всегда.";
+          dbg("[Sreda-Ext] " + msg);
+          notify(pi, msg, "info");
+          return { content: [{ type: "text", text: msg }] };
+        }
         setStateEnabled(v);
-        const msg = v ? "Sreda: автоматические уведомления ВКЛЮЧЕНЫ" : "Sreda: автоматические уведомления ВЫКЛЮЧЕНЫ";
+        const msg = v
+          ? "Sreda: автоматические уведомления ВКЛЮЧЕНЫ"
+          : "Sreda: автоматические уведомления ВЫКЛЮЧЕНЫ (запрошено пользователем)";
         dbg("[Sreda-Ext] " + msg);
         notify(pi, msg, "info");
         return { content: [{ type: "text", text: msg }] };

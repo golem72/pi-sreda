@@ -8,3 +8,6 @@ state.json
 extensions/sreda-messenger/.sreda-notify.json
 # лог диагностики расширения sreda-messenger (не в TUI, в файле)
 extensions/sreda-messenger/.sreda-ext.log
+# конфликтные файлы Syncthing / логи рантайма skill
+*.sync-conflict-*.json
+skills/sreda_send/err.log
